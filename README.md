@@ -1,68 +1,117 @@
-# MNIST Classification: notebook et version C++
+# MNIST Number Classification from Scratch
 
-Ce dossier contient deux implementations du meme objectif: entrainer un reseau de neurones sur MNIST et produire un fichier de soumission, sans librairie de machine learning.
+An educational implementation of a handwritten-digit classifier in both **Python/NumPy** and **C++/Armadillo**. The model is trained from scratch: the forward pass, softmax output, backpropagation, gradient descent, and dropout are implemented directly, without TensorFlow, PyTorch, or scikit-learn.
 
-## 1) `image_classif.ipynb`
+## What this project covers
 
-Le notebook est une version Python/Numpy, organisee en étapes:
+- loading MNIST-style data from CSV files;
+- reconstructing and displaying `28 × 28` grayscale digits;
+- building a fully connected neural network from basic matrix operations;
+- training with sigmoid activations, softmax, cross-entropy gradients, and dropout;
+- tracking training accuracy and retaining the best parameters;
+- predicting test labels and exporting a submission CSV;
+- comparing equivalent Python and C++ implementations.
 
-1. Chargement des donnees:
-   - lit `train_mnist.csv` et `test_mnist.csv` avec pandas.
-   - affiche les shapes et un apercu des colonnes.
+## Model architecture
 
-2. Exploration visuelle:
-   - detecte les colonnes pixels (`1x1` ... `28x28`),
-   - reconstruit des images `28x28`,
-   - affiche une image unique puis une grille aleatoire.
+```text
+784 input pixels → hidden layer → 10 output classes
+                    sigmoid          softmax
+```
 
-3. Entrainement d'un MLP (multiclasse):
-   - architecture: entree 784 -> couche cachée sigmoid -> sortie 10 classes (softmax),
-   - one-hot sur les labels,
-   - mini-batch gradient descent,
-   - dropout (inverted dropout) sur la couche cachee,
-   - suivi de l'accuracy train par epoch,
-   - sauvegarde des meilleurs poids/biais (`best`).
+| Implementation | Hidden units | Optimisation | Dropout | Output |
+| --- | ---: | --- | ---: | --- |
+| Python/NumPy | 64 | Mini-batch gradient descent, 30 epochs | 20% | `data/submission.csv` |
+| C++/Armadillo | 128 | Full-batch gradient descent, 6,000 iterations | 20% | `data/submission_cpp.csv` |
 
-4. Prediction et soumission:
-   - applique le modele sauvegardé sur le test,
-   - crée `submission.csv` avec les colonnes `id,label`.
+The implementations intentionally use slightly different hyperparameters, so their predictions are not expected to be identical.
 
-## 2) `mnist.cpp`
+## Project structure
 
-Le fichier C++ (Armadillo) est la transposition du pipeline du notebook:
+```text
+.
+├── mnist.py          # Python/NumPy implementation
+├── mnist.cpp                 # C++/Armadillo implementation
+├── data/
+│   ├── train_mnist.csv       # Labels and 784 pixel columns
+│   ├── test_mnist.csv        # IDs and 784 pixel columns
+│   ├── sample_submission.csv
+│   ├── submission.csv
+│   └── submission_cpp.csv
+└── README.md
+```
 
-1. Fonctions mathematiques:
-   - `sigmoid`, `sigmoid_deriv`, `softmax`, `one_hot`, `dropout_mask`.
+## Dataset format
 
-2. Parsing CSV:
-   - `CSVRow` lit les lignes CSV rapidement,
-   - `parse_header_columns` identifie colonnes `label`, `id` et pixels.
+Each image is represented by 784 columns named from `1x1` to `28x28`. Pixel values are expected to be in the `[0, 255]` range.
 
-3. Chargement donnees:
-   - `load_mnist_data` charge train (`X` + `y`),
-   - `load_mnist_test_data` charge test (`X` + `ids`),
-   - normalisation des pixels en `[0,1]`.
+- Training data: an `id` column, a `label` column, and 784 pixel columns.
+- Test data: an `id` column and 784 pixel columns.
+- Submission: two columns, `id` and `label`.
 
-4. Entrainement:
-   - `train_nn` entraine un MLP 784 -> hidden -> 10,
-   - softmax + cross-entropy,
-   - dropout sur la couche cachee,
-   - sauvegarde dans `NNModel` des meilleurs poids/biais selon l'accuracy.
+> [!NOTE]
+> Some pandas exports name the identifier column `Unnamed: 0`. Rename that column to `id` before running the programs, because both implementations expect `id`.
 
-5. Inference et export:
-   - `predict_proba` calcule les probabilités,
-   - `predict` retourne la classe argmax,
-   - `write_submission_csv` écrit le fichier de soumission.
+## Run the Python implementation
 
-6. `main`:
-   - charge train, affiche des checks,
-   - entraine le modele,
-   - charge test, predit les labels,
-   - écrit un fichier de soumission (actuellement appelé `submission_cpp.csv`).
+Create and activate a virtual environment:
 
-## 3) Relation entre les deux fichiers
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+```
 
-- `image_classif.ipynb`: ideation/experimentation rapide en Python.
-- `mnist.cpp`: version executable C++ plus structurée pour reproduction et performance.
+Install the dependencies:
 
-Les deux suivent la meme logique globale: extraction pixels -> entrainement MLP -> prediction test -> soumission `id,label`.
+```bash
+python -m pip install numpy pandas matplotlib
+```
+
+Run the training and prediction pipeline from the repository root:
+
+```bash
+python mnist.py
+```
+
+The script displays a digit and a random image grid, trains the network, prints the training accuracy after every epoch, and writes `data/submission.csv`.
+
+## Build and run the C++ implementation
+
+Install a C++17 compiler and the Armadillo linear-algebra library, then compile:
+
+```bash
+c++ -std=c++17 -O3 mnist.cpp -o mnist -larmadillo
+```
+
+Run the executable from the repository root:
+
+```bash
+./mnist
+```
+
+The program prints an ASCII preview of a digit, reports loss and training accuracy during optimisation, and writes `data/submission_cpp.csv`.
+
+## How training works
+
+1. Pixel columns are ordered and reshaped into 784-element input vectors.
+2. Pixel intensities are scaled to the `[0, 1]` range.
+3. A hidden layer applies the sigmoid activation.
+4. Inverted dropout randomly disables hidden activations during training.
+5. The output layer produces class probabilities with softmax.
+6. Backpropagation computes the weight and bias gradients.
+7. Gradient descent updates the parameters, while the best training checkpoint is retained.
+
+## Current limitations
+
+- Model selection is based on training accuracy; there is no validation split yet.
+- The network has a single hidden layer and fixed hyperparameters.
+- The code is designed for learning and experimentation, not production inference.
+- The Python and C++ training loops are not exact performance equivalents.
+
+## Possible next steps
+
+- add a validation set and report reproducible evaluation metrics;
+- add command-line options for hyperparameters and file paths;
+- save and reload trained model parameters;
+- add automated tests for activations, gradients, and CSV parsing;
+- benchmark the Python and C++ implementations under matching settings.
