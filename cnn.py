@@ -69,7 +69,7 @@ def softmax(logits: np.ndarray) -> np.ndarray:
     Converts logits (batch_size, n_classes) into probabilities that sum to 1.
     Numeric stability trick: subtract row-wise max before exp.
     """
-    stabilized = logits - logits.max(axis=1, keepsdims=True)
+    stabilized = logits - logits.max(axis=1, keepdims=True)
     exp_scores = np.exp(stabilized)
     return exp_scores /exp_scores.sum(axis=1, keepdims=True)
 
@@ -106,7 +106,7 @@ def extract_and_sort_pixel_columns(df: pd.DataFrame)->list[str]:
     """Extracts pixel columns like '1x1'..'28x28' and sorts them by (row, col)."""
     pixel_columns = [
         col for col in df.columns
-        if "x" in col and col.split("x")[0].isdigit() and col.split[1].isdigit()
+        if "x" in col and col.split("x")[0].isdigit() and col.split("x")[1].isdigit()
     ]
     return sorted(pixel_columns, key=lambda s: (int(s.split("x")[0]), int(s.split("x")[1])))
 
@@ -185,43 +185,166 @@ def calculate_kernel(matrix: np.ndarray, weights: np.ndarray):
     return feature_map
 
 
-def calculate_filters(matrix: np.ndarray, weights: np.ndarray):
+def calculate_filters(matrix: np.ndarray, weights: np.ndarray, biases: np.ndarray):
     feature_map = {} # n * rows * cols = 8 * 26 * 26
-    biases = np.zeros(8)
     for i in range(weights.shape[0]):
         feature_map[i] = calculate_kernel(matrix, weights[i]) + biases[i]
-    return np.stack(feature_map)
+    return np.stack(list(feature_map.values()))
 
 
-def pooling(matrix, ksize, method = 'max', pad=False): # pad when dimensions not // by blocs size
+def pooling(matrix, ksize, pad=False): # pad when dimensions not // by blocs size
     m, n = matrix.shape[:2]
     ky, kx = ksize
 
     _ceil = lambda x, y: int(np.ceil(x / float(y)))
 
     if pad:
-        ny = _ceil(m, ky)
-        nx = _ceil(n, kx)
-        size = (ny * ky, nx * kx) + matrix.shape[2:]
-        mat_pad = np.full(size, np.nan)
-        mat_pad[:m, :n, ...] = matrix
+        ny = _ceil(m, ky)   # blocks needed to cover all height
+        nx = _ceil(n, kx)   # blocks needed to cover all width
+        size = (ny * ky, nx * kx) + matrix.shape[2:]    # dimensions needed for complete blocks
+        mat_pad = np.full(size, np.nan)     # full map NaN
+        mat_pad[:m, :n, ...] = matrix       # fill only top left corner
     else:
-        ny = m // ky
+        ny = m // ky    # n complete blocks for each dimension
         nx = n // kx
-        mat_pad = matrix[:ny*ky, :nx*kx, ...]
+        mat_pad = matrix[:ny*ky, :nx*kx, ...]   # remove incompletes rows/cols
 
-    new_shape = (ny, ky, nx, kx) + matrix.shape[2:]
     # 0:ny      which line group
     # 1:ky      which line inside the bloc
     # 2:nx      which column group
     # 3:kx      which column inside the bloc
 
-    if method == "max":
-        result = np.nanmax(mat_pad.reshape(new_shape), axis=(1, 3))
-    else:
-        result = np.nanmean(mat_pad.reshape(new_shape), axis=(1, 3))
-    return result
+    blocks = mat_pad.reshape(ny, ky, nx, kx)    # seperate each dimension en block number
+    blocks = blocks.transpose(0, 2, 1, 3)       # regroup different bloc axis
+    blocks = blocks.reshape(ny, nx, ky * kx)    # flatten : ky * kx vectors
+
+    result = np.nanmax(blocks, axis=-1)      # block maximum
+    indices = np.nanargmax(blocks, axis=-1)  # block maximum indices
+
+    # convert indices into coordinates in the entry map
+    block_rows, block_cols = np.indices((ny, nx))
+
+    rows = block_rows * ky + indices // kx  # find global row : block beginning + local row
+    cols = block_cols * kx + indices % kx   # find global col : block beginning + local col
+
+    # coordinates in pairs -> shape: (ny, nx, 2)
+    max_positions = np.stack((rows, cols), axis=-1)
+
+    return result, max_positions
 
 
-def forward_pass():
-    ...
+def flatten(pooling_maps):
+    # /!\ Suppose that we add batch axis before
+    initial_shape = pooling_maps.shape          # keep shape for the gradient
+    flattened_maps = pooling_maps.reshape(pooling_maps.shape[0], -1)     # (8, 13, 13) -> (1352,)
+    return initial_shape, flattened_maps
+
+
+def dense(x, w, b):
+    # X: (N, 1352)
+    # W: (1352, 10)
+    # b: (10,)
+    # Z: (N, 10)
+
+    # Z = XW + b
+    Z = x @ w + b
+    return Z
+
+
+
+def forward_pass(
+        X: np.ndarray,
+        weights_conv: np.ndarray,
+        weights_dense: np.ndarray,
+        biases_conv: np.ndarray,
+        biases_dense: np.ndarray,
+        ):
+    conv = calculate_filters(X, weights_conv, biases_conv)
+    relu = ReLu(conv)
+
+    pooled_maps = []
+    max_positions = []
+
+    for f in range(relu.shape[0]):
+        pooled_map, positions = pooling(relu[f], (2, 2))
+        pooled_maps.append(pooled_map)
+        max_positions.append(positions)
+
+    pooled_maps = np.stack(pooled_maps)     # pooled_maps : (8, 13, 13)
+    max_positions = np.stack(max_positions) # max_positions : (8, 13, 13, 2)
+
+    initial_shape, flattened = flatten(pooled_maps[None, ...])   # flattened : (1, 1352)
+    
+    z = dense(flattened, weights_dense, biases_dense)
+    out = softmax(z)
+
+    cache = {
+        "X": X,
+        "conv": conv,
+        "flattened": flattened,
+        "max_positions": max_positions,
+        "initial_shape": initial_shape,
+    }
+    return out, cache
+
+
+def cross_entropy(x: np.ndarray, y: np.ndarray):
+    x = np.clip(x, 1e-12, 1.0)
+    produit = y * np.log(x)
+    L = np.sum(produit, axis=1)
+    return np.mean(-L)
+
+
+def softmax_cross_entropy_backward(x: np.ndarray, y: np.ndarray):
+    """
+    How much loss change based on score changing.
+    x: probabilities
+    y: one-hot labels
+    dZ: logits gradient (N, 10)
+    """
+    N = x.shape[0]
+    dZ = (x - y) / N
+    return dZ
+
+
+def dense_backward(
+        dZ: np.ndarray,
+        flattened: np.ndarray,
+        weights_dense: np.ndarray
+    ):
+    dW = flattened.T @ dZ       # (1352, N) @ (N, 10) = (1352, 10)
+    db = np.sum(dZ, axis=0)     # bias on every image, we add every contribution
+    dF = dZ @ weights_dense.T   # (N, 1O) @ (10, 1352) = (N, 1352)
+    return dF, dW, db
+
+
+def pooling_backward(
+        d_pool: np.ndarray,
+        max_positions: np.ndarray,
+        input_shape: tuple[int, int],
+    ):
+    """
+    Creates a table of zeros of input_shape shape.
+    For every d_pool value, we get the coresponding coordinates in max_positions.
+    We add this value at these coordinates in the outing table.
+    """
+    table = np.zeros(input_shape, dtype=d_pool.dtype)
+
+    for i in range(d_pool.shape[0]):
+        for j in range(d_pool.shape[1]):
+            row, col = max_positions[i, j]
+            table[row, col] += d_pool[i, j]
+
+    return table
+
+
+def relu_backward(dA: np.ndarray, Z: np.ndarray):
+    """
+    dA : Gradient from pooling_backward
+    Z: Values before ReLU, kept in cache["conv"]
+
+    If ReLu is positive : gradient goes through
+    Else : zero
+    """
+    return dA * (Z > 0)
+    
