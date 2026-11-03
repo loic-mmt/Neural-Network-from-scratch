@@ -347,4 +347,42 @@ def relu_backward(dA: np.ndarray, Z: np.ndarray):
     Else : zero
     """
     return dA * (Z > 0)
+
+
+def conv_backward(
+        X: np.ndarray,              # forward image (28, 28)
+        weights_conv: np.ndarray,   # filter weights (8, 3, 3)
+        d_conv: np.ndarray,         # gradients after relu_backward (8, 26, 26)
+    ):
+    """
+    Calculate 3 different things:
+    - dW: filter gradients, weights_conv shape
+    - db: bias gradients, (8, ) shape
+    - dX: entry image gradient, X shape
+    """
+    n_filters, kh, kw = weights_conv.shape
+    _, out_h, out_w = d_conv.shape
+
+    dW = np.zeros_like(weights_conv)
+    db = np.zeros(n_filters)
+    dX = np.zeros_like(X)
+
+    for f in range(n_filters):
+        # bias gradient
+        db[f] = np.sum(d_conv[f])
+
+        for i in range(out_h):
+            for j in range(out_w):
+                gradient = d_conv[f, i, j]
+
+                # image window used in forward
+                window = X[i:i+kh, j:j+kw]
+
+                # gradient of filter weights
+                dW[f] += gradient * window
+
+                # gradient of input image
+                dX[i:i+kh, j:j+kw] += (gradient*weights_conv[f])
+                
+    return dX, dW, db
     
