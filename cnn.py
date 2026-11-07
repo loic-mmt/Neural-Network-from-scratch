@@ -24,12 +24,12 @@ import matplotlib.pyplot as plt
 # ----------------------------
 TRAIN_CSV_PATH = "data/train_mnist.csv"
 TEST_CSV_PATH = "data/test_mnist.csv"
-SUBMISSION_CSV_PATH = "data/submission.csv"
+SUBMISSION_CSV_PATH = "data/submission_cnn.csv"
 
 RANDOM_SEED = 1
 
 # Model / training hyperparameters
-LEARNING_RATE = 0.1
+LEARNING_RATE = 0.001
 HIDDEN_UNITS = 64
 EPOCHS = 100
 BATCH_SIZE = 256
@@ -40,7 +40,7 @@ USE_DROPOUT = True
 DROPOUT_PROB = 0.2  # probability to drop a hidden unit
 
 # Visualization
-SHOW_PLOTS = True
+SHOW_PLOTS = False
 
 
 # ----------------------------
@@ -84,7 +84,7 @@ def one_hot_encode(labels: np.ndarray, num_classes: int = 10) -> np.ndarray:
     labels: shape (N,)
     returns: shape (N, num_classes)
     """
-    one_hot = np.zeros((len(labels), num_classes), dtype=np.float32)
+    one_hot = np.zeros((len(labels), num_classes), dtype=np.float64)
     one_hot[np.arange(len(labels)), labels] = 1.0
     return one_hot
 
@@ -98,7 +98,7 @@ def make_inverted_dropout_mask(shape: tuple[int, int], drop_prob: float)->np.nda
         shape: (batch_size, hidden_units)
         returns mask with same shape.
     """
-    keep_mask = (np.random.rand(*shape) > drop_prob).astype(np.float32) # 1 if kept, 0 if dropped
+    keep_mask = (np.random.rand(*shape) > drop_prob).astype(np.float64) # 1 if kept, 0 if dropped
     return keep_mask / (1.0 - drop_prob)
 
 
@@ -192,6 +192,18 @@ def calculate_filters(matrix: np.ndarray, weights: np.ndarray, biases: np.ndarra
     return np.stack(list(feature_map.values()))
 
 
+def calculate_filters_vertorized(matrix: np.ndarray, weights: np.ndarray, biases: np.ndarray):
+    kh, kw = weights.shape[1:]
+    windows = np.lib.stride_tricks.sliding_window_view(matrix, (kh, kw))
+    # einsum describe multiplication and axes to sum
+    # ijab : position (i, j), local pixel (a, b)
+    # fab  : filter f, local weight (a, b)
+    # fij  : filter f result, position (i, j)
+    feature_maps = np.einsum("ijab, fab->fij", windows, weights)
+    # feature_maps[f, i, j] = sum on a,b of windows[i,j,a,b] × weights[f,a,b]
+    return feature_maps + biases[:, None, None] # (8,) to (8, 1, 1)
+
+
 def pooling(matrix, ksize, pad=False): # pad when dimensions not // by blocs size
     m, n = matrix.shape[:2]
     ky, kx = ksize
@@ -259,7 +271,7 @@ def forward_pass(
         biases_conv: np.ndarray,
         biases_dense: np.ndarray,
         ):
-    conv = calculate_filters(X, weights_conv, biases_conv)
+    conv = calculate_filters_vertorized(X, weights_conv, biases_conv)
     relu = ReLu(conv)
 
     pooled_maps = []
@@ -338,6 +350,21 @@ def pooling_backward(
     return table
 
 
+def pooling_backward_vectorized(
+        d_pool: np.ndarray,
+        max_positions: np.ndarray,
+        input_shape: tuple[int, int],
+    ):
+    table = np.zeros(input_shape, dtype=d_pool.dtype)
+
+    # maxima positions
+    rows = max_positions[..., 0]
+    cols = max_positions[..., 1]
+
+    np.add.at(table, (rows, cols), d_pool) # add each gradient to it's position
+    return table
+
+
 def relu_backward(dA: np.ndarray, Z: np.ndarray):
     """
     dA : Gradient from pooling_backward
@@ -385,4 +412,203 @@ def conv_backward(
                 dX[i:i+kh, j:j+kw] += (gradient*weights_conv[f])
                 
     return dX, dW, db
+
+
+def conv_backward_vectorized(
+        X: np.ndarray,
+        weights_conv: np.ndarray,
+        d_conv: np.ndarray,
+    ):
+    _, kh, kw = weights_conv.shape
+    _, out_h, out_w = d_conv.shape
+
+    windows = np.lib.stride_tricks.sliding_window_view(X, (kh, kw))
+
+    # sum on positions i, j.
+    dW = np.einsum("fij,ijab->fab", d_conv, windows)
+
+    # bias used everywhere -> sum of every gradient
+    db = d_conv.sum(axis=(1, 2))
+    # each pixel receive contributions from multiple windows and filters
+    # accumulation with +=
+    dX = np.zeros_like(X)
+
+    # one passage for each filter position : 3x3
+    for a in range(kh):
+        for b in range(kw):
+            contribution = np.einsum("fij, f->ij", d_conv, weights_conv[:, a, b])
+            dX[a:a + out_h, b:b + out_w] += contribution
+
+    return dX, dW, db
     
+
+def backward_pass(
+        out: np.ndarray,            # predicted proba
+        y: np.ndarray,              # real class (1, 10)
+        cache: dict,                # forward values for derivatives
+        weights_dense: np.ndarray,  # gradients to dense entry
+        weights_conv: np.ndarray,   # for conv_backward
+    ):
+    """
+    Loss → Softmax → Dense → Flatten → Pooling → ReLU → Conv
+    """
+    dZ = softmax_cross_entropy_backward(out, y) # loss gradient 
+
+    dF, dW_dense, db_dense = dense_backward(dZ, cache["flattened"], weights_dense)
+    # for Z = F @ W + b:
+        # dW_dense = F.T @ dZ : each entry contribute to each score
+        # db_dense = dZ.sum(axis=0) : bias added to the scores
+        # dF = dZ @ W.T : redistribute errors to convolution caracteristics (1, 1352)
+
+    d_pool = dF.reshape(cache["initial_shape"])[0] # (1, 1352) → (1, 8, 13, 13) → (8, 13, 13)
+    # flatten only change values positions → original positions. 
+    # [0] take out batch axis add on forward step
+
+    d_relu = np.zeros_like(cache["conv"])
+
+    for f in range(d_pool.shape[0]):
+        d_relu[f] = pooling_backward_vectorized(
+            d_pool[f],
+            cache["max_positions"][f],
+            cache["conv"][f].shape
+            )
+        # d_relu : (8, 26, 26)
+        # in each block : only max selected influence output, the rest get 0
+    
+    d_conv = relu_backward(d_relu, cache["conv"]) # cache["conv"] = values before ReLu
+
+    dX, dW_conv, db_conv = conv_backward_vectorized(cache["X"], weights_conv, d_conv)
+    # dW_conv (8, 3, 3): filter variations direction
+    # db_conv (8,): bias variations direction
+    # dX (28, 28): image gradient
+    grads = {
+        "weights_conv": dW_conv,
+        "biases_conv": db_conv,
+        "weights_dense": dW_dense,
+        "biases_dense": db_dense,
+    }
+    return dX, grads
+
+
+def initialize_parameters(seed: int = RANDOM_SEED):
+    rng = np.random.default_rng(seed)
+    # σ diff than in MLP because CNN need other scale
+    return {
+        "weights_conv": rng.normal(0, np.sqrt(2 / 9), (8, 3, 3)),
+        "biases_conv": np.zeros(8),
+        "weights_dense": rng.normal(0, np.sqrt(1 / 1352), (1352, 10)),
+        "biases_dense": np.zeros(10),
+    }
+
+
+def train_cnn(
+    train_inputs: np.ndarray,         # (N, 28, 28), normalized
+    train_labels_onehot: np.ndarray,  # (N, 10)
+    learning_rate: float = LEARNING_RATE,
+    epochs: int = EPOCHS,
+    seed: int = RANDOM_SEED,
+    ):
+    """
+    train_inputs: (N, 28, 28), normalized to [0, 1]
+    train_labels_onehot: (N, 10)
+    """
+    params = initialize_parameters(seed)
+    rng = np.random.default_rng(seed)
+    num_samples = len(train_inputs)
+
+    for epoch in range(epochs):
+        indices = rng.permutation(num_samples)
+        total_loss = 0.0
+
+        for i in indices:
+            X = train_inputs[i]             # (28, 28)
+            y = train_labels_onehot[i:i+ 1] # (1, 10)
+
+            out, cache = forward_pass(X, **params)
+            total_loss += float(cross_entropy(out , y))
+
+            _, grads = backward_pass(out, y, cache, params["weights_dense"], params["weights_conv"])
+
+            for name in params:
+                params[name] -= learning_rate * grads[name]
+
+        mean_loss = total_loss / num_samples
+        active_fraction = np.mean(cache["conv"] > 0)
+        print(f"Epoch {epoch + 1}/{epochs} | loss = {mean_loss:.4f} | ReLU positives dernière image={active_fraction:.1%}")
+
+    return params
+
+
+def predict_probabilities(
+        inputs: np.ndarray,
+        params: dict,
+    )-> np.ndarray:
+    """inputs: (N, 28, 28). Returns: (N, 10)."""
+    probabilities = np.empty((len(inputs), 10))
+
+    for i, image in enumerate(inputs):
+        out, _ = forward_pass(image, **params)
+        probabilities[i] = out[0]
+
+    return probabilities
+
+
+def predict_labels(
+    inputs: np.ndarray,
+    params: dict,
+) -> np.ndarray:
+    probabilities = predict_probabilities(inputs, params)
+    return np.argmax(probabilities, axis=1) # select highest-probability class for each image.
+
+
+def main() -> None:
+    print("Loading data...")
+    train_df, test_df = load_mnist_csvs(TRAIN_CSV_PATH, TEST_CSV_PATH)
+    print("Data Loaded...")
+
+    print("Extracting pixels...")
+    train_pixel_cols = extract_and_sort_pixel_columns(train_df)
+    test_pixel_cols = extract_and_sort_pixel_columns(test_df)
+    print("Pixels extracted...")
+
+    # Train data
+    print("Preparing inputs...")
+    train_inputs = (train_df[train_pixel_cols].to_numpy().astype(np.float64)) / 255.0  # (N, 784)
+    train_labels_int = train_df["label"].to_numpy().astype(int)  # (N,)
+    train_labels_onehot = one_hot_encode(train_labels_int, num_classes=10)  # (N, 10)
+    print("Inputs prepared...")
+
+    # Optional visualization
+    if SHOW_PLOTS:
+        show_single_example(train_inputs, train_labels_int, train_df, index=13)
+        show_grid_examples(train_inputs, train_labels_int, grid_size=5)
+
+    # CNN needs (N, 28, 28) : currently (N, 784)
+    print("Last inputs reshape...")
+    train_inputs = train_inputs.reshape(-1, 28, 28)
+
+    # Train the model
+    print("Training model...")
+    params = train_cnn(
+        train_inputs=train_inputs,
+        train_labels_onehot=train_labels_onehot,
+        learning_rate=LEARNING_RATE,
+        epochs=EPOCHS,
+        seed=RANDOM_SEED,
+    )
+
+    # Test data
+    test_inputs = (test_df[test_pixel_cols].to_numpy().astype(np.float64) / 255.0).reshape(-1, 28, 28)
+    print("Predicting tests labels...")
+    test_predictions = predict_labels(test_inputs, params)
+
+    print("Writing submission...")
+    submission_df = test_df[["id"]].copy()
+    submission_df["label"] = test_predictions
+    submission_df.to_csv(SUBMISSION_CSV_PATH, index=False)
+
+    print(f"\nSaved submission to: {SUBMISSION_CSV_PATH}")
+
+
+if __name__ == "__main__":
+    main()
