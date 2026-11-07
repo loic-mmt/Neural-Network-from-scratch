@@ -1,117 +1,131 @@
-# MNIST Number Classification from Scratch
+# MNIST Digit Classification from Scratch
 
-An educational implementation of a handwritten-digit classifier in both **Python/NumPy** and **C++/Armadillo**. The model is trained from scratch: the forward pass, softmax output, backpropagation, gradient descent, and dropout are implemented directly, without TensorFlow, PyTorch, or scikit-learn.
+Three handwritten-digit classifiers built from basic numerical operations: a fully connected neural network (MLP) in **Python/NumPy** and **C++/Armadillo**, and a convolutional neural network (CNN) in **Python/NumPy**.
 
-## What this project covers
+Forward passes, backpropagation, and parameter updates are implemented directly, without TensorFlow, PyTorch, or scikit-learn. NumPy and Armadillo provide array operations and linear algebra; pandas handles CSV files and Matplotlib displays images.
 
-- loading MNIST-style data from CSV files;
-- reconstructing and displaying `28 × 28` grayscale digits;
-- building a fully connected neural network from basic matrix operations;
-- training with sigmoid activations, softmax, cross-entropy gradients, and dropout;
-- tracking training accuracy and retaining the best parameters;
-- predicting test labels and exporting a submission CSV;
-- comparing equivalent Python and C++ implementations.
+## Kaggle results
 
-## Model architecture
+| Model | Kaggle score |
+| --- | ---: |
+| MLP — Python/NumPy | 0.89100 |
+| MLP — C++/Armadillo | 0.90766 |
+| CNN — Python/NumPy | **0.97125** |
+
+The CNN result was obtained with a **learning rate of 0.001 and 100 epochs**. These are submitted Kaggle scores, not local validation scores. The models use different architectures and training settings, so these results are not a controlled comparison of Python and C++ performance.
+
+## Models
+
+### Fully connected networks
+
+Both MLP implementations flatten each image into 784 input values:
 
 ```text
-784 input pixels → hidden layer → 10 output classes
-                    sigmoid          softmax
+784 pixels → Dense → Sigmoid → Dropout → Dense → Softmax → 10 probabilities
 ```
 
-| Implementation | Hidden units | Optimisation | Dropout | Output |
-| --- | ---: | --- | ---: | --- |
-| Python/NumPy | 64 | Mini-batch gradient descent, 30 epochs | 20% | `data/submission.csv` |
-| C++/Armadillo | 128 | Full-batch gradient descent, 6,000 iterations | 20% | `data/submission_cpp.csv` |
+| Setting | Python/NumPy | C++/Armadillo |
+| --- | --- | --- |
+| Hidden units | 64 | 128 |
+| Parameter updates | Mini-batch gradient descent, batch size 256 | Full-batch gradient descent |
+| Training duration | 30 epochs | 6,000 iterations |
+| Hidden dropout | 20% | 20% |
+| Model selection | Best training accuracy | Best training accuracy |
+| Submission | `data/submission.csv` | `data/submission_cpp.csv` |
 
-The implementations intentionally use slightly different hyperparameters, so their predictions are not expected to be identical.
+### Convolutional network
 
-## Project structure
+The CNN preserves the spatial structure of each image:
+
+```text
+Input                  1 × 28 × 28
+  ↓ Conv: 8 filters, 3 × 3, stride 1, no padding
+Feature maps           8 × 26 × 26
+  ↓ ReLU
+  ↓ Max pooling: 2 × 2, stride 2
+Pooled maps            8 × 13 × 13
+  ↓ Flatten
+Features               1352
+  ↓ Dense
+Class scores           10
+  ↓ Softmax
+Class probabilities    10
+```
+
+Convolution applies the same small filters across the image to learn local patterns. ReLU sets negative activations to zero, max pooling keeps the strongest activation in each block, and the dense layer combines the extracted features into class scores.
+
+Training uses cross-entropy loss and stochastic gradient descent (SGD), with **one parameter update per image**. Images are shuffled each epoch. The backward pass traverses dense, flatten, pooling, ReLU, and convolution operations in reverse order.
+
+Convolution uses `sliding_window_view` to expose image patches and `einsum` to combine them with filter weights. Its backward pass is also vectorized, retaining only small loops over kernel positions. Pooling gradients are routed to the selected maxima with `np.add.at`.
+
+| Setting | CNN |
+| --- | --- |
+| Learning rate | 0.001 |
+| Epochs | 100 |
+| Random seed | 1 |
+| Batch size | 1 (SGD) |
+| Dropout | Not applied |
+| Model selection | Final epoch parameters |
+| Submission | `data/submission_cnn.csv` |
+
+## Dataset and project structure
 
 ```text
 .
-├── mnist.py          # Python/NumPy implementation
-├── mnist.cpp                 # C++/Armadillo implementation
+├── mnist.py                     # Fully connected network, Python/NumPy
+├── mnist.cpp                    # Fully connected network, C++/Armadillo
+├── cnn.py                       # Convolutional network, Python/NumPy
 ├── data/
-│   ├── train_mnist.csv       # Labels and 784 pixel columns
-│   ├── test_mnist.csv        # IDs and 784 pixel columns
+│   ├── train_mnist.csv
+│   ├── test_mnist.csv
 │   ├── sample_submission.csv
-│   ├── submission.csv
-│   └── submission_cpp.csv
+│   ├── submission.csv           # Generated by mnist.py
+│   ├── submission_cpp.csv       # Generated by mnist.cpp
+│   └── submission_cnn.csv       # Generated by cnn.py
 └── README.md
 ```
 
-## Dataset format
+Place the input CSVs in `data/` before running a script. Each image has 784 pixel columns named `1x1` through `28x28`, with intensities in `[0, 255]`.
 
-Each image is represented by 784 columns named from `1x1` to `28x28`. Pixel values are expected to be in the `[0, 255]` range.
+- Training CSV: `id`, `label`, and pixel columns; labels are integers from 0 to 9.
+- Test CSV: `id` and pixel columns.
+- Submission CSV: `id,label`, preserving test identifiers and row order.
 
-- Training data: an `id` column, a `label` column, and 784 pixel columns.
-- Test data: an `id` column and 784 pixel columns.
-- Submission: two columns, `id` and `label`.
+Pixel columns are sorted by row and column, then normalized to `[0, 1]`. MLP inputs have shape `(N, 784)`; CNN inputs have shape `(N, 28, 28)`.
 
-> [!NOTE]
-> Some pandas exports name the identifier column `Unnamed: 0`. Rename that column to `id` before running the programs, because both implementations expect `id`.
+## Run the Python models
 
-## Run the Python implementation
-
-Create and activate a virtual environment:
+From the repository root, create an environment and install dependencies:
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-```
-
-Install the dependencies:
-
-```bash
 python -m pip install numpy pandas matplotlib
 ```
 
-Run the training and prediction pipeline from the repository root:
+Run the fully connected network:
 
 ```bash
 python mnist.py
 ```
 
-The script displays a digit and a random image grid, trains the network, prints the training accuracy after every epoch, and writes `data/submission.csv`.
+Or run the CNN:
 
-## Build and run the C++ implementation
+```bash
+python cnn.py
+```
 
-Install a C++17 compiler and the Armadillo linear-algebra library, then compile:
+Adjust paths, learning rate, epochs, and plotting options in each script's configuration section. The MLP reports training accuracy; the CNN reports mean training loss and the fraction of positive pre-ReLU values for the last image of each epoch. Both export predictions after training.
+
+The CNN currently trains one image at a time. Vectorization speeds up its convolution operations, but 100 epochs can still take substantial time. Reduce `EPOCHS` for a short exploratory run.
+
+## Build and run the C++ model
+
+Install a C++17 compiler and Armadillo, then run from the repository root:
 
 ```bash
 c++ -std=c++17 -O3 mnist.cpp -o mnist -larmadillo
-```
-
-Run the executable from the repository root:
-
-```bash
 ./mnist
 ```
 
-The program prints an ASCII preview of a digit, reports loss and training accuracy during optimisation, and writes `data/submission_cpp.csv`.
-
-## How training works
-
-1. Pixel columns are ordered and reshaped into 784-element input vectors.
-2. Pixel intensities are scaled to the `[0, 1]` range.
-3. A hidden layer applies the sigmoid activation.
-4. Inverted dropout randomly disables hidden activations during training.
-5. The output layer produces class probabilities with softmax.
-6. Backpropagation computes the weight and bias gradients.
-7. Gradient descent updates the parameters, while the best training checkpoint is retained.
-
-## Current limitations
-
-- Model selection is based on training accuracy; there is no validation split yet.
-- The network has a single hidden layer and fixed hyperparameters.
-- The code is designed for learning and experimentation, not production inference.
-- The Python and C++ training loops are not exact performance equivalents.
-
-## Possible next steps
-
-- add a validation set and report reproducible evaluation metrics;
-- add command-line options for hyperparameters and file paths;
-- save and reload trained model parameters;
-- add automated tests for activations, gradients, and CSV parsing;
-- benchmark the Python and C++ implementations under matching settings.
+The program displays an ASCII preview of a digit, reports loss and training accuracy during optimization, and writes `data/submission_cpp.csv`.
