@@ -1,10 +1,10 @@
 """MNIST CNN digit classification from scratch (NumPy).
 
-This script is a cleaned, .py-friendly version of a notebook-style workflow:
-- Loads train/test CSVs (Kaggle-style: id, label, pixel columns like "1x1" .. "28x28")
-- Visualizes a few samples (optional)
-- Trains a 2-hidden-layer convolutional neural network with sigmoid + softmax and (optional) inverted dropout
-- Writes a submission CSV
+Loads MNIST-style CSVs, optionally displays samples, and trains:
+Conv1 -> ReLU -> Pool -> Conv2 -> ReLU -> Flatten -> Dense -> Softmax.
+Both convolutions use 3x3 kernels, stride 1, and no padding.
+Training uses per-image SGD and cross-entropy, without dropout or early stopping.
+The final parameters produce a submission CSV.
 
 Usage:
   python cnn.py
@@ -30,14 +30,11 @@ RANDOM_SEED = 1
 
 # Model / training hyperparameters
 LEARNING_RATE = 0.001
-HIDDEN_UNITS = 64
 EPOCHS = 100
-BATCH_SIZE = 256
-EARLY_STOPPING = 15
+NUM_FILTERS = 16   # F1: first convolution output channels
+NUM_FILTERS2 = 8   # F2: second convolution output channels
 
-# Dropout
-USE_DROPOUT = True
-DROPOUT_PROB = 0.2  # probability to drop a hidden unit
+EARLY_STOPPING = 15
 
 # Visualization
 SHOW_PLOTS = False
@@ -91,10 +88,10 @@ def one_hot_encode(labels: np.ndarray, num_classes: int = 10) -> np.ndarray:
 
 def make_inverted_dropout_mask(shape: tuple[int, int], drop_prob: float)->np.ndarray:
     """Inverted dropout mask.
-    
+
         - Each unit is kept with probability (1 - drop_prob)
         - We divide by (1 - drop_prob) to keep the activation expectation unchanged.
-    
+
         shape: (batch_size, hidden_units)
         returns mask with same shape.
     """
@@ -154,10 +151,10 @@ def show_grid_examples(images_flat: np.ndarray, labels: np.ndarray, grid_size: i
 
 
 # ----------------------------
-# Model: 3 hidden layer CNN
-
-# X -> Conv -> ReLu -> Pool -> Flatten -> Dense -> Loss
-# Loss -> Dense -> Flatten -> Pool -> Relu -> Conv
+# Model: two convolutional layers and one dense output layer
+# F1 = NUM_FILTERS, F2 = NUM_FILTERS2, D = F2 * 11 * 11.
+# X -> Conv1 -> ReLU1 -> Pool -> Conv2 -> ReLU2 -> Flatten -> Dense -> Softmax
+# Backward: loss -> logits -> Dense -> Flatten -> ReLU2 -> Conv2 -> Pool -> ReLU1 -> Conv1
 # ----------------------------
 
 def calculate_one_kernel(
@@ -186,13 +183,13 @@ def calculate_kernel(matrix: np.ndarray, weights: np.ndarray):
 
 
 def calculate_filters(matrix: np.ndarray, weights: np.ndarray, biases: np.ndarray):
-    feature_map = {} # n * rows * cols = 8 * 26 * 26
+    feature_map = {}  # (F1, out_h, out_w); loop-based reference implementation
     for i in range(weights.shape[0]):
         feature_map[i] = calculate_kernel(matrix, weights[i]) + biases[i]
     return np.stack(list(feature_map.values()))
 
 
-def calculate_filters_vertorized(matrix: np.ndarray, weights: np.ndarray, biases: np.ndarray):
+def calculate_filters_vectorized(matrix: np.ndarray, weights: np.ndarray, biases: np.ndarray):
     kh, kw = weights.shape[1:]
     windows = np.lib.stride_tricks.sliding_window_view(matrix, (kh, kw))
     # einsum describe multiplication and axes to sum
@@ -201,7 +198,24 @@ def calculate_filters_vertorized(matrix: np.ndarray, weights: np.ndarray, biases
     # fij  : filter f result, position (i, j)
     feature_maps = np.einsum("ijab, fab->fij", windows, weights)
     # feature_maps[f, i, j] = sum on a,b of windows[i,j,a,b] × weights[f,a,b]
-    return feature_maps + biases[:, None, None] # (8,) to (8, 1, 1)
+    return feature_maps + biases[:, None, None] # (F1,) -> (F1, 1, 1), broadcast over spatial positions
+
+
+def conv_multichannel(X: np.ndarray, weights: np.ndarray, biases: np.ndarray):
+    # X: (C, H, W)
+    # weights: (F, C, kh, kw)
+    _, _, kh, kw = weights.shape
+
+    windows = np.lib.stride_tricks.sliding_window_view(X, (kh, kw), axis=(1, 2))
+    # windows: (C, out_h, out_w, kh, kw)
+
+    out = np.einsum("cijab, fcab->fij", windows, weights)
+    # c : entry canal.
+    # i,j : position dans carte de sortie.
+    # a,b : position locale dans filtre.
+    # f : filtre de sortie.
+    # c,a,b disappear → sum on these 3 axis
+    return out + biases[:, None, None]
 
 
 def pooling(matrix, ksize, pad=False): # pad when dimensions not // by blocs size
@@ -246,15 +260,15 @@ def pooling(matrix, ksize, pad=False): # pad when dimensions not // by blocs siz
 
 
 def flatten(pooling_maps):
-    # /!\ Suppose that we add batch axis before
-    initial_shape = pooling_maps.shape          # keep shape for the gradient
-    flattened_maps = pooling_maps.reshape(pooling_maps.shape[0], -1)     # (8, 13, 13) -> (1352,)
+    # Input includes a batch axis: (N, F2, 11, 11) -> (N, D).
+    initial_shape = pooling_maps.shape  # Restore this shape during backward.
+    flattened_maps = pooling_maps.reshape(pooling_maps.shape[0], -1)
     return initial_shape, flattened_maps
 
 
 def dense(x, w, b):
-    # X: (N, 1352)
-    # W: (1352, 10)
+    # X: (N, D)
+    # W: (D, 10)
     # b: (10,)
     # Z: (N, 10)
 
@@ -268,10 +282,12 @@ def forward_pass(
         X: np.ndarray,
         weights_conv: np.ndarray,
         weights_dense: np.ndarray,
+        weights_conv2: np.ndarray,
         biases_conv: np.ndarray,
         biases_dense: np.ndarray,
+        biases_conv2: np.ndarray,
         ):
-    conv = calculate_filters_vertorized(X, weights_conv, biases_conv)
+    conv = calculate_filters_vectorized(X, weights_conv, biases_conv)
     relu = ReLu(conv)
 
     pooled_maps = []
@@ -282,11 +298,13 @@ def forward_pass(
         pooled_maps.append(pooled_map)
         max_positions.append(positions)
 
-    pooled_maps = np.stack(pooled_maps)     # pooled_maps : (8, 13, 13)
-    max_positions = np.stack(max_positions) # max_positions : (8, 13, 13, 2)
+    pooled_maps = np.stack(pooled_maps)     # (F1, 13, 13)
+    max_positions = np.stack(max_positions) # (F1, 13, 13, 2)
 
-    initial_shape, flattened = flatten(pooled_maps[None, ...])   # flattened : (1, 1352)
-    
+    conv2 = conv_multichannel(pooled_maps, weights_conv2, biases_conv2)  # (F2, 11, 11)
+    relu2 = ReLu(conv2)
+    initial_shape, flattened = flatten(relu2[None, ...])   # (1, F2, 11, 11) -> (1, D)
+
     z = dense(flattened, weights_dense, biases_dense)
     out = softmax(z)
 
@@ -296,6 +314,8 @@ def forward_pass(
         "flattened": flattened,
         "max_positions": max_positions,
         "initial_shape": initial_shape,
+        "pooled_maps": pooled_maps,
+        "conv2": conv2,
     }
     return out, cache
 
@@ -324,9 +344,9 @@ def dense_backward(
         flattened: np.ndarray,
         weights_dense: np.ndarray
     ):
-    dW = flattened.T @ dZ       # (1352, N) @ (N, 10) = (1352, 10)
+    dW = flattened.T @ dZ       # (D, N) @ (N, 10) -> (D, 10)
     db = np.sum(dZ, axis=0)     # bias on every image, we add every contribution
-    dF = dZ @ weights_dense.T   # (N, 1O) @ (10, 1352) = (N, 1352)
+    dF = dZ @ weights_dense.T   # (N, 10) @ (10, D) -> (N, D)
     return dF, dW, db
 
 
@@ -367,8 +387,8 @@ def pooling_backward_vectorized(
 
 def relu_backward(dA: np.ndarray, Z: np.ndarray):
     """
-    dA : Gradient from pooling_backward
-    Z: Values before ReLU, kept in cache["conv"]
+    dA: upstream activation gradient, with the same shape as Z.
+    Z: values before the corresponding ReLU (cache["conv"] or cache["conv2"]).
 
     If ReLu is positive : gradient goes through
     Else : zero
@@ -378,13 +398,13 @@ def relu_backward(dA: np.ndarray, Z: np.ndarray):
 
 def conv_backward(
         X: np.ndarray,              # forward image (28, 28)
-        weights_conv: np.ndarray,   # filter weights (8, 3, 3)
-        d_conv: np.ndarray,         # gradients after relu_backward (8, 26, 26)
+        weights_conv: np.ndarray,   # first-layer filter weights (F1, 3, 3)
+        d_conv: np.ndarray,         # gradients after ReLU1 backward (F1, 26, 26)
     ):
     """
     Calculate 3 different things:
     - dW: filter gradients, weights_conv shape
-    - db: bias gradients, (8, ) shape
+    - db: bias gradients, (F1,) shape
     - dX: entry image gradient, X shape
     """
     n_filters, kh, kw = weights_conv.shape
@@ -410,7 +430,7 @@ def conv_backward(
 
                 # gradient of input image
                 dX[i:i+kh, j:j+kw] += (gradient*weights_conv[f])
-                
+
     return dX, dW, db
 
 
@@ -440,7 +460,7 @@ def conv_backward_vectorized(
             dX[a:a + out_h, b:b + out_w] += contribution
 
     return dX, dW, db
-    
+
 
 def backward_pass(
         out: np.ndarray,            # predicted proba
@@ -448,21 +468,29 @@ def backward_pass(
         cache: dict,                # forward values for derivatives
         weights_dense: np.ndarray,  # gradients to dense entry
         weights_conv: np.ndarray,   # for conv_backward
+        weights_conv2: np.ndarray,
     ):
     """
-    Loss → Softmax → Dense → Flatten → Pooling → ReLU → Conv
+    Loss + Softmax → Dense → Flatten → ReLU2 → Conv2 → Pool → ReLU1 → Conv1
     """
-    dZ = softmax_cross_entropy_backward(out, y) # loss gradient 
+    dZ = softmax_cross_entropy_backward(out, y) # gradient with respect to logits (1, 10)
 
     dF, dW_dense, db_dense = dense_backward(dZ, cache["flattened"], weights_dense)
     # for Z = F @ W + b:
         # dW_dense = F.T @ dZ : each entry contribute to each score
         # db_dense = dZ.sum(axis=0) : bias added to the scores
-        # dF = dZ @ W.T : redistribute errors to convolution caracteristics (1, 1352)
+        # dF = dZ @ W.T : gradient of flattened Conv2 activations (1, D)
 
-    d_pool = dF.reshape(cache["initial_shape"])[0] # (1, 1352) → (1, 8, 13, 13) → (8, 13, 13)
-    # flatten only change values positions → original positions. 
+    d_relu2 = dF.reshape(cache["initial_shape"])[0]
+    d_conv2 = relu_backward(d_relu2, cache["conv2"])
+    # (1, D) -> (1, F2, 11, 11) -> (F2, 11, 11)
+    # flatten only change values positions → original positions.
     # [0] take out batch axis add on forward step
+
+    d_pool, dW_conv2, db_conv2 = conv_multichannel_backward(
+        cache["pooled_maps"], weights_conv2, d_conv2
+    )  # d_pool: (F1, 13, 13)
+
 
     d_relu = np.zeros_like(cache["conv"])
 
@@ -472,31 +500,55 @@ def backward_pass(
             cache["max_positions"][f],
             cache["conv"][f].shape
             )
-        # d_relu : (8, 26, 26)
+        # d_relu: (F1, 26, 26)
         # in each block : only max selected influence output, the rest get 0
-    
+
     d_conv = relu_backward(d_relu, cache["conv"]) # cache["conv"] = values before ReLu
 
     dX, dW_conv, db_conv = conv_backward_vectorized(cache["X"], weights_conv, d_conv)
-    # dW_conv (8, 3, 3): filter variations direction
-    # db_conv (8,): bias variations direction
+    # dW_conv (F1, 3, 3): first-layer weight gradients
+    # db_conv (F1,): first-layer bias gradients
     # dX (28, 28): image gradient
     grads = {
         "weights_conv": dW_conv,
         "biases_conv": db_conv,
         "weights_dense": dW_dense,
         "biases_dense": db_dense,
+        "weights_conv2": dW_conv2,
+        "biases_conv2": db_conv2,
     }
     return dX, grads
 
 
+def conv_multichannel_backward(X: np.ndarray, weights: np.ndarray, d_out: np.ndarray):
+    _, _, kh, kw = weights.shape
+    _, out_h, out_w = d_out.shape
+
+    windows = np.lib.stride_tricks.sliding_window_view(X, (kh, kw), axis=(1, 2))
+
+    dW = np.einsum("fij,cijab->fcab", d_out, windows)
+    db = d_out.sum(axis=(1, 2))
+
+    dX = np.zeros_like(X)
+
+    for a in range(kh):
+        for b in range(kw):
+            contribution = np.einsum("fij,fc->cij", d_out, weights[:, :, a, b])
+            dX[:, a:a + out_h, b:b + out_w] += contribution
+    # dX redistribute gradients to each canal by summy filters contributions
+    return dX, dW, db
+
+
 def initialize_parameters(seed: int = RANDOM_SEED):
     rng = np.random.default_rng(seed)
-    # σ diff than in MLP because CNN need other scale
+    num_features = NUM_FILTERS2 * 11 * 11
+    # He scaling for ReLU convolutions; dense fan-in is F2 * 11 * 11.
     return {
-        "weights_conv": rng.normal(0, np.sqrt(2 / 9), (8, 3, 3)),
-        "biases_conv": np.zeros(8),
-        "weights_dense": rng.normal(0, np.sqrt(1 / 1352), (1352, 10)),
+        "weights_conv": rng.normal(0, np.sqrt(2 / 9), (NUM_FILTERS, 3, 3)),
+        "biases_conv": np.zeros(NUM_FILTERS),
+        "weights_conv2": rng.normal(0, np.sqrt(2 / (NUM_FILTERS * 3 * 3)), (NUM_FILTERS2, NUM_FILTERS, 3, 3)),
+        "biases_conv2": np.zeros(NUM_FILTERS2),
+        "weights_dense": rng.normal(0, np.sqrt(1 / num_features), (num_features, 10)),
         "biases_dense": np.zeros(10),
     }
 
@@ -527,14 +579,14 @@ def train_cnn(
             out, cache = forward_pass(X, **params)
             total_loss += float(cross_entropy(out , y))
 
-            _, grads = backward_pass(out, y, cache, params["weights_dense"], params["weights_conv"])
+            _, grads = backward_pass(out, y, cache, params["weights_dense"], params["weights_conv"], params["weights_conv2"])
 
             for name in params:
                 params[name] -= learning_rate * grads[name]
 
         mean_loss = total_loss / num_samples
         active_fraction = np.mean(cache["conv"] > 0)
-        print(f"Epoch {epoch + 1}/{epochs} | loss = {mean_loss:.4f} | ReLU positives dernière image={active_fraction:.1%}")
+        print(f"Epoch {epoch + 1}/{epochs} | loss = {mean_loss:.4f} | ReLU1 positives dernière image={active_fraction:.1%}")
 
     return params
 
