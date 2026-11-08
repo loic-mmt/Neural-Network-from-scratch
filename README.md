@@ -10,9 +10,9 @@ Forward passes, backpropagation, and parameter updates are implemented directly,
 | --- | ---: |
 | MLP — Python/NumPy | 0.89100 |
 | MLP — C++/Armadillo | 0.90766 |
-| CNN — Python/NumPy | **0.97125** |
+| CNN — Python/NumPy | **0.98041 public / 0.98271 private** |
 
-The CNN result was obtained with a **learning rate of 0.001 and 100 epochs**. These are submitted Kaggle scores, not local validation scores. The models use different architectures and training settings, so these results are not a controlled comparison of Python and C++ performance.
+The CNN result was obtained with **18 and 8 filters, a learning rate of 0.001, and 100 epochs**. The current script defaults to 16 and 8 filters. These are submitted Kaggle scores, not local validation scores. The models use different architectures and training settings, so these results are not a controlled comparison of Python and C++ performance.
 
 ## Models
 
@@ -35,17 +35,20 @@ Both MLP implementations flatten each image into 784 input values:
 
 ### Convolutional network
 
-The CNN preserves the spatial structure of each image:
+The CNN uses two convolutional layers. With the current default filter counts:
 
 ```text
 Input                  1 × 28 × 28
-  ↓ Conv: 8 filters, 3 × 3, stride 1, no padding
-Feature maps           8 × 26 × 26
+  ↓ Conv1: 16 filters, 3 × 3, stride 1, no padding
+Feature maps           16 × 26 × 26
   ↓ ReLU
   ↓ Max pooling: 2 × 2, stride 2
-Pooled maps            8 × 13 × 13
+Pooled maps            16 × 13 × 13
+  ↓ Conv2: 8 filters, 3 × 3, stride 1, no padding
+Feature maps           8 × 11 × 11
+  ↓ ReLU
   ↓ Flatten
-Features               1352
+Features               968
   ↓ Dense
 Class scores           10
   ↓ Softmax
@@ -54,12 +57,13 @@ Class probabilities    10
 
 Convolution applies the same small filters across the image to learn local patterns. ReLU sets negative activations to zero, max pooling keeps the strongest activation in each block, and the dense layer combines the extracted features into class scores.
 
-Training uses cross-entropy loss and stochastic gradient descent (SGD), with **one parameter update per image**. Images are shuffled each epoch. The backward pass traverses dense, flatten, pooling, ReLU, and convolution operations in reverse order.
+Training uses cross-entropy loss and stochastic gradient descent (SGD), with **one parameter update per image**. Images are shuffled each epoch. The second convolution combines all first-layer feature maps. The backward pass traverses dense, flatten, ReLU2, Conv2, pooling, ReLU1, and Conv1 in reverse order.
 
 Convolution uses `sliding_window_view` to expose image patches and `einsum` to combine them with filter weights. Its backward pass is also vectorized, retaining only small loops over kernel positions. Pooling gradients are routed to the selected maxima with `np.add.at`.
 
 | Setting | CNN |
 | --- | --- |
+| Convolution filters | 16 → 8 (current defaults) |
 | Learning rate | 0.001 |
 | Epochs | 100 |
 | Random seed | 1 |
