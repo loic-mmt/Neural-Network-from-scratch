@@ -3,8 +3,8 @@
 Loads MNIST-style CSVs, optionally displays samples, and trains:
 Conv1 -> ReLU -> Pool -> Conv2 -> ReLU -> Flatten -> Dense -> Softmax.
 Both convolutions use 3x3 kernels, stride 1, and no padding.
-Training uses per-image SGD and cross-entropy, without dropout or early stopping.
-The final parameters produce a submission CSV.
+Training uses per-image SGD, random translations, and cross-entropy, without dropout.
+Early stopping monitors validation loss; the best validation checkpoint produces a submission CSV.
 
 Usage:
   python cnn.py
@@ -34,7 +34,7 @@ EPOCHS = 100
 NUM_FILTERS = 16   # F1: first convolution output channels
 NUM_FILTERS2 = 8   # F2: second convolution output channels
 
-EARLY_STOPPING = 15
+EARLY_STOPPING = 15  # Patience: consecutive epochs without lower validation loss.
 
 # Visualization
 SHOW_PLOTS = False
@@ -126,6 +126,57 @@ def load_mnist_csvs(train_path: str, test_path: str, verbose = False) -> tuple[p
         print(test_df.head(2))
 
     return train_df, test_df
+
+
+def split_train_validation(
+        labels: np.ndarray,
+        validation_fraction: float = 0.1,
+        seed: int = RANDOM_SEED,
+    ):
+    if not 0 < validation_fraction < 1:
+        raise ValueError("validation_fraction must be ]0,1[")
+    rng = np.random.default_rng(seed)
+    train_indices = []
+    validation_indices = []
+
+    for label in np.unique(labels):
+        indices = np.flatnonzero(labels == label)
+
+        if len(indices) < 2:
+            raise ValueError("Each class needs à least 2 examples")
+        rng.shuffle(indices)
+
+        num_validation = round(len(indices) * validation_fraction)
+        num_validation = max(1, min(num_validation, len(indices) - 1))
+
+        validation_indices.extend(indices[:num_validation])
+        train_indices.extend(indices[num_validation:])
+
+    train_indices = np.array(train_indices, dtype=int)
+    validation_indices = np.array(validation_indices, dtype=int)
+    # np.array instead of np.ndarray :
+        # np.array converts the list values into an array of indices.
+        # np.ndarray interprets the list as the shape of a new array.
+
+    rng.shuffle(train_indices)
+    rng.shuffle(validation_indices)
+
+    return train_indices, validation_indices
+
+
+def evaluate(
+        inputs: np.ndarray,
+        targets_onehot: np.ndarray,
+        params: dict,
+    ):
+    probabilities = predict_probabilities(inputs, params)
+    loss = float(cross_entropy(probabilities, targets_onehot))
+
+    predictions = np.argmax(probabilities, axis = 1)
+    targets = np.argmax(targets_onehot, axis=1)
+    accuracy = float(np.mean(predictions == targets)) # proportion of correctly classified
+
+    return loss, accuracy
 
 
 def show_single_example(images_flat: np.ndarray, labels: np.ndarray, train_df: pd.DataFrame, index: int) -> None:
@@ -553,42 +604,110 @@ def initialize_parameters(seed: int = RANDOM_SEED):
     }
 
 
+def random_translation(
+        image: np.ndarray,
+        rng: np.random.Generator,
+        max_shift: int = 2,
+)->np.ndarray:
+    height, width = image.shape
+
+    if not 0 <= max_shift < min(height, width):
+        raise ValueError("max_shift must be nonnegative and smaller than image dimensions")
+
+    if max_shift == 0:
+        return image.copy()
+
+    dy, dx = rng.integers(-max_shift, max_shift + 1, size=2)
+
+    translated = np.zeros_like(image)
+
+    src_y = slice(max(0, -dy), min(height, height - dy))
+    src_x = slice(max(0, -dx), min(width, width - dx))
+
+    dst_y = slice(max(0, dy), min(height, height + dy))
+    dst_x = slice(max(0, dx), min(width, width + dx))
+
+    translated[dst_y, dst_x] = image[src_y, src_x]
+
+    return translated
+
+
 def train_cnn(
     train_inputs: np.ndarray,         # (N, 28, 28), normalized
     train_labels_onehot: np.ndarray,  # (N, 10)
+    validation_inputs: np.ndarray,
+    validation_labels_onehot: np.ndarray,
     learning_rate: float = LEARNING_RATE,
     epochs: int = EPOCHS,
     seed: int = RANDOM_SEED,
+    max_shift: int = 2,
+    patience: int = EARLY_STOPPING,
     ):
     """
     train_inputs: (N, 28, 28), normalized to [0, 1]
     train_labels_onehot: (N, 10)
+    Returns an in-memory copy of the parameters with the lowest validation loss.
+    Stops after patience consecutive epochs without improvement.
     """
+    if epochs < 1 or patience < 1:
+        raise ValueError("epochs and patience must be positive")
+
     params = initialize_parameters(seed)
+    best_params = None
+    best_loss = float("inf")
+    best_epoch = 0
+    epochs_without_improvement = 0
     rng = np.random.default_rng(seed)
+    augmentation_rng = np.random.default_rng(seed + 1)
+    # 2 generators → translations doesn't change shuffle
     num_samples = len(train_inputs)
 
     for epoch in range(epochs):
         indices = rng.permutation(num_samples)
-        total_loss = 0.0
 
         for i in indices:
-            X = train_inputs[i]             # (28, 28)
+            X = random_translation(
+                train_inputs[i],
+                augmentation_rng,
+                max_shift=max_shift
+            )
             y = train_labels_onehot[i:i+ 1] # (1, 10)
 
             out, cache = forward_pass(X, **params)
-            total_loss += float(cross_entropy(out , y))
 
             _, grads = backward_pass(out, y, cache, params["weights_dense"], params["weights_conv"], params["weights_conv2"])
 
             for name in params:
                 params[name] -= learning_rate * grads[name]
 
-        mean_loss = total_loss / num_samples
-        active_fraction = np.mean(cache["conv"] > 0)
-        print(f"Epoch {epoch + 1}/{epochs} | loss = {mean_loss:.4f} | ReLU1 positives dernière image={active_fraction:.1%}")
+        train_loss, train_accuracy = evaluate(train_inputs, train_labels_onehot, params)
 
-    return params
+        validation_loss, validation_accuracy = evaluate(validation_inputs, validation_labels_onehot, params)
+
+        if not np.isfinite(validation_loss):
+            raise FloatingPointError("Validation loss is not finite")
+
+        if validation_loss < best_loss:
+            best_loss = validation_loss
+            best_epoch = epoch + 1
+            # Copy arrays: later in-place SGD updates must not change the checkpoint.
+            best_params = {name: value.copy() for name, value in params.items()}
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
+
+        print(
+            f"Epoch {epoch + 1}/{epochs} | "
+            f"train loss={train_loss:.4f}, acc={train_accuracy:.2%} | "
+            f"val loss={validation_loss:.4f}, acc={validation_accuracy:.2%}"
+        )
+
+        if epochs_without_improvement >= patience:
+            print(f"Early stopping: {patience} epochs without validation loss improvement.")
+            break
+
+    print(f"Restoring epoch {best_epoch} | best val loss={best_loss:.4f}")
+    return best_params
 
 
 def predict_probabilities(
@@ -639,11 +758,21 @@ def main() -> None:
     print("Last inputs reshape...")
     train_inputs = train_inputs.reshape(-1, 28, 28)
 
+    # train / val split
+    train_indices, validation_indices = split_train_validation(train_labels_int, seed=RANDOM_SEED)
+    fit_inputs = train_inputs[train_indices]
+    fit_targets = train_labels_onehot[train_indices]
+
+    validation_inputs = train_inputs[validation_indices]
+    validation_targets = train_labels_onehot[validation_indices]
+
     # Train the model
     print("Training model...")
     params = train_cnn(
-        train_inputs=train_inputs,
-        train_labels_onehot=train_labels_onehot,
+        train_inputs=fit_inputs,
+        train_labels_onehot=fit_targets,
+        validation_inputs = validation_inputs,
+        validation_labels_onehot = validation_targets,
         learning_rate=LEARNING_RATE,
         epochs=EPOCHS,
         seed=RANDOM_SEED,
